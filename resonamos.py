@@ -1,28 +1,88 @@
 import streamlit as st
 import pandas as pd
 import json
-import os
+import gspread
 from datetime import datetime, date
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Eventos Resonamos", page_icon="🧘🏻", layout="wide")
 
-# ── Persistence ───────────────────────────────────────────────────────────────
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events_data.json")
+# ── Persistence (Google Sheets) ───────────────────────────────────────────────
+# Each event is one row. The nested "costs" and "attendee_log" lists are stored
+# as JSON strings inside their own cells, so the data structure stays identical
+# to the old JSON-file version — only where it lives has changed.
+SHEET_TAB = "events"
+COLUMNS = [
+    "id", "name", "date", "ticket_price", "expected_attendees",
+    "confirmed_attendees", "earnings_goal", "costs", "attendee_log",
+]
+
+@st.cache_resource(show_spinner=False)
+def _get_worksheet():
+    """Connect to Google Sheets once and return the 'events' tab (creating it if missing)."""
+    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    spreadsheet = gc.open_by_key(st.secrets["sheet_id"])
+    try:
+        ws = spreadsheet.worksheet(SHEET_TAB)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=SHEET_TAB, rows=100, cols=len(COLUMNS))
+        ws.update(values=[COLUMNS], range_name="A1", value_input_option="RAW")
+    return ws
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return []
+    """Read every event from the sheet and rebuild the nested Python structure."""
+    ws = _get_worksheet()
+    records = ws.get_all_records(numericise_ignore=["all"])  # all cells as strings
+    events = []
+    for r in records:
+        if not str(r.get("id", "")).strip():
+            continue  # skip blank rows
+        events.append({
+            "id":                  str(r["id"]),
+            "name":                str(r.get("name", "")),
+            "date":                str(r.get("date", "")),
+            "ticket_price":        float(r.get("ticket_price") or 0),
+            "expected_attendees":  int(float(r.get("expected_attendees") or 0)),
+            "confirmed_attendees": int(float(r.get("confirmed_attendees") or 0)),
+            "earnings_goal":       float(r.get("earnings_goal") or 0),
+            "costs":               json.loads(r["costs"]) if r.get("costs") else [],
+            "attendee_log":        json.loads(r["attendee_log"]) if r.get("attendee_log") else [],
+        })
+    return events
 
 def save_data(events):
-    with open(DATA_FILE, "w") as f:
-        json.dump(events, f, indent=2)
+    """Overwrite the sheet with the current events (header row + one row per event)."""
+    ws = _get_worksheet()
+    rows = [COLUMNS]
+    for e in events:
+        rows.append([
+            str(e["id"]),
+            e.get("name", ""),
+            e.get("date", ""),
+            str(e.get("ticket_price", 0)),
+            str(e.get("expected_attendees", 0)),
+            str(e.get("confirmed_attendees", 0)),
+            str(e.get("earnings_goal", 0)),
+            json.dumps(e.get("costs", []), ensure_ascii=False),
+            json.dumps(e.get("attendee_log", []), ensure_ascii=False),
+        ])
+    ws.clear()
+    ws.update(values=rows, range_name="A1", value_input_option="RAW")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if "events" not in st.session_state:
-    st.session_state.events = load_data()
+    try:
+        st.session_state.events = load_data()
+    except Exception as err:
+        st.error(
+            "No pude conectar con Google Sheets. Revisa que:\n\n"
+            "1. Los *secrets* `gcp_service_account` y `sheet_id` estén configurados "
+            "(Settings → Secrets).\n"
+            "2. La hoja de cálculo esté compartida (como Editor) con el "
+            "`client_email` del service account.\n\n"
+            f"Detalle técnico: {err}"
+        )
+        st.stop()
 if "editing_id" not in st.session_state:
     st.session_state.editing_id = None
 if "editing_log_id" not in st.session_state:
